@@ -83,8 +83,15 @@ def build_user_profile_vec(
     alpha near 0.0 = mostly based on keywords
     """
     # 1) Paper component (mean of user paper embeddings)
-    paper_vecs = [embed_paper(t, a) for (t, a) in user_papers_data]
-    paper_profile = np.mean(paper_vecs, axis=0) if paper_vecs else None
+    if user_papers_data:
+        texts = [paper_text(t, a) for (t, a) in user_papers_data]
+        vecs = get_model().encode(texts, convert_to_numpy=True)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        paper_vecs = vecs / norms
+        paper_profile = np.mean(paper_vecs, axis=0)
+    else:
+        paper_profile = None
 
     # 2) Keyword component (weighted sum of keyword embeddings)
     if keyword_weights:
