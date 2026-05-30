@@ -121,11 +121,13 @@ def recommend_topk(
     user_vec: np.ndarray,
     candidate_vecs: np.ndarray,   # shape: (N, D)
     candidate_ids: list[int],
-    k: int = 5
+    k: int = 5,
+    candidate_years: list[int] = None
 ):
     """
     Fast vectorized cosine similarity.
     Everything is assumed to be normalized, so similarity is dot product.
+    If candidate_years is provided, the top K results are sorted from youngest to oldest.
     """
     if candidate_vecs.size == 0:
         return []
@@ -139,6 +141,12 @@ def recommend_topk(
     # Sort them by score
     top_idx = top_idx[np.argsort(-sims[top_idx])]
     
+    if candidate_years is not None:
+        results = [(candidate_ids[i], float(sims[i]), candidate_years[i]) for i in top_idx]
+        # Sort by year (descending), then by score (descending)
+        results.sort(key=lambda x: (-x[2], -x[1]))
+        return [(r[0], r[1]) for r in results]
+
     return [(candidate_ids[i], float(sims[i])) for i in top_idx]
 
 def serialize_embedding(v: np.ndarray) -> bytes:

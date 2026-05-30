@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: induct_rec
+Version: 0.1.0
+Summary: Induct's recommendation algorithm
+Author: Induct
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: torch>=2.0.0
+Requires-Dist: sentence-transformers>=2.0.0
+Dynamic: author
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

@@ -1,0 +1,11 @@
+LICENSE
+README.md
+setup.py
+src/induct_rec/__init__.py
+src/induct_rec/algorithm.py
+src/induct_rec.egg-info/PKG-INFO
+src/induct_rec.egg-info/SOURCES.txt
+src/induct_rec.egg-info/dependency_links.txt
+src/induct_rec.egg-info/requires.txt
+src/induct_rec.egg-info/top_level.txt
+tests/test_recommendations_pure.py
