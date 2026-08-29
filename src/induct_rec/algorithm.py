@@ -122,10 +122,13 @@ def recommend_topk(
     candidate_vecs: np.ndarray,   # shape: (N, D)
     candidate_ids: list[int],
     k: int = 5,
-    candidate_years: list[int] = None
+    candidate_years: list[int] = None,
+    candidate_credibilities: list[float] = None,
+    credibility_weight: float = 0.2,
+    pool_size: int = 250
 ):
     """
-    Fast vectorized cosine similarity.
+    Fast vectorized cosine similarity with optional credibility re-ranking.
     Everything is assumed to be normalized, so similarity is dot product.
     If candidate_years is provided, the top K results are sorted from youngest to oldest.
     """
@@ -135,19 +138,51 @@ def recommend_topk(
     # Cosine sim is dot product for normalized vectors
     sims = candidate_vecs @ user_vec  # shape: (N,)
     
-    # Get top K indices
-    num_to_get = min(k, len(sims))
-    top_idx = np.argpartition(-sims, kth=num_to_get-1)[:num_to_get]
-    # Sort them by score
-    top_idx = top_idx[np.argsort(-sims[top_idx])]
+    if candidate_credibilities is not None:
+        creds = np.array(candidate_credibilities)
+        # Stage 1: Get top M (pool_size) by semantic similarity
+        actual_pool = min(pool_size, len(sims))
+        if actual_pool < len(sims):
+            pool_idx = np.argpartition(-sims, kth=actual_pool-1)[:actual_pool]
+        else:
+            pool_idx = np.arange(len(sims))
+            
+        # Stage 2: Calculate composite score for the pool
+        # final_score = similarity * (1 + alpha * credibility)
+        pool_sims = sims[pool_idx]
+        pool_creds = creds[pool_idx]
+        
+        # Ensure similarity is non-negative for the multiplier so negative sims don't get worse
+        pool_sims_positive = np.maximum(pool_sims, 0)
+        final_scores = pool_sims_positive * (1.0 + credibility_weight * pool_creds)
+        
+        # Get top K from the pool
+        num_to_get = min(k, len(pool_idx))
+        if num_to_get < len(pool_idx):
+            top_k_pool_idx = np.argpartition(-final_scores, kth=num_to_get-1)[:num_to_get]
+        else:
+            top_k_pool_idx = np.arange(len(pool_idx))
+            
+        # Sort the top K by final_score
+        top_k_pool_idx = top_k_pool_idx[np.argsort(-final_scores[top_k_pool_idx])]
+        top_idx = pool_idx[top_k_pool_idx]
+        
+        # Use final_scores for the returned values
+        returned_scores = final_scores[top_k_pool_idx]
+    else:
+        # Standard behavior without credibility
+        num_to_get = min(k, len(sims))
+        top_idx = np.argpartition(-sims, kth=num_to_get-1)[:num_to_get]
+        top_idx = top_idx[np.argsort(-sims[top_idx])]
+        returned_scores = sims[top_idx]
     
     if candidate_years is not None:
-        results = [(candidate_ids[i], float(sims[i]), candidate_years[i]) for i in top_idx]
+        results = [(candidate_ids[i], float(returned_scores[idx]), candidate_years[i]) for idx, i in enumerate(top_idx)]
         # Sort by year (descending), then by score (descending)
         results.sort(key=lambda x: (-x[2], -x[1]))
         return [(r[0], r[1]) for r in results]
 
-    return [(candidate_ids[i], float(sims[i])) for i in top_idx]
+    return [(candidate_ids[i], float(returned_scores[idx])) for idx, i in enumerate(top_idx)]
 
 def serialize_embedding(v: np.ndarray) -> bytes:
     """Serializes a numpy array to bytes for DB storage."""
