@@ -140,11 +140,20 @@ def recommend_topk(
     
     if candidate_credibilities is not None:
         creds = np.array(candidate_credibilities)
-        # Stage 1: Sort all candidates strictly by semantic similarity descending
-        sorted_indices = np.argsort(-sims)
+        # Stage 1: Filter out negative similarity vectors (sims >= 0.0)
+        relevance_mask = sims >= 0.0
+        if not np.any(relevance_mask):
+            relevance_mask = np.ones_like(sims, dtype=bool)
 
-        # Stage 2: Process in 50-paper tiers (chunks) to ensure domain relevance boundary
-        tier_size = 50
+        valid_indices = np.where(relevance_mask)[0]
+        valid_sims = sims[valid_indices]
+        valid_creds = creds[valid_indices]
+
+        sorted_order = np.argsort(-valid_sims)
+        sorted_indices = valid_indices[sorted_order]
+
+        # Stage 2: Process in 15-paper tiers (chunks) to enforce tight domain relevance boundaries
+        tier_size = 15
         final_ordered_indices = []
         final_scores_list = []
 
@@ -153,7 +162,7 @@ def recommend_topk(
             tier_sims = sims[tier_idx]
             tier_creds = creds[tier_idx]
 
-            # Bounded log-credibility multiplier within this 50-paper tier
+            # Bounded log-credibility multiplier within this 15-paper tier
             tier_sims_pos = np.maximum(tier_sims, 0)
             tier_scores = tier_sims_pos * (1.0 + 0.15 * np.log1p(np.maximum(tier_creds, 0)))
 
