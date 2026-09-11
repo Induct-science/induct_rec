@@ -28,9 +28,15 @@ if _hf_token:
     except Exception:
         pass  # non-fatal — model still loads anonymously
 
+# The embedding model, driven by env so it can be swapped without a code
+# change (the induct_be app sets EMBED_MODEL / EMBEDDING_DIM as the single
+# source of truth — see app/utils/embedding_config.py). Changing the model
+# requires re-embedding all papers + users and re-tuning the thresholds below.
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "all-MiniLM-L6-v2")
+
 # Minimum cosine similarity between a user's profile embedding and a paper
 # embedding for that user's expertise to count toward the paper's credibility.
-# all-MiniLM-L6-v2: 0.5 ≈ meaningful domain overlap; tune down to 0.4 if too strict.
+# NOTE: specific to EMBED_MODEL's cosine distribution — re-tune if you change it.
 CREDIBILITY_SIMILARITY_THRESHOLD = 0.25
 
 _model = None
@@ -43,8 +49,8 @@ def get_model():
         return _model
     with _model_lock:
         if _model is None:  # double-checked locking
-            print("⏳ Loading SentenceTransformer model ('all-MiniLM-L6-v2')...")
-            _model = SentenceTransformer("all-MiniLM-L6-v2")
+            print(f"⏳ Loading SentenceTransformer model ('{EMBED_MODEL}')...")
+            _model = SentenceTransformer(EMBED_MODEL)
     return _model
 
 
