@@ -1,5 +1,6 @@
 import os
 import threading
+import datetime
 import numpy as np
 import pickle
 from sentence_transformers import SentenceTransformer
@@ -130,7 +131,10 @@ def recommend_topk(
     k: int = 5,
     candidate_years: list[int] = None,
     candidate_credibilities: list[float] = None,
-    credibility_weight: float = 0.2,
+    credibility_weight: float = 0.15,
+    candidate_saliences: list[float] = None,
+    age_penalty_weight: float = 0.5,
+    current_year: int = None,
     pool_size: int = 250
 ):
     """
@@ -143,6 +147,46 @@ def recommend_topk(
 
     # Cosine sim is dot product for normalized vectors
     sims = candidate_vecs @ user_vec  # shape: (N,)
+
+    # --- Age penalty (applied OUTSIDE the 15-paper tiers) -------------------
+    #
+    # Deliberately placed before the tiering, so it changes which tier a paper
+    # lands in rather than only its position inside one. That makes it a
+    # stronger lever than the credibility multiplier below, which can never
+    # move a paper more than 14 positions. A recent paper can therefore
+    # outrank a more topically relevant older one — that is the intent.
+    #
+    # `salience / age` is the age-adjusted attention a paper has attracted.
+    # Measured on production 2026-09-20 (tools/README_paper_age_analysis.md):
+    # raw citation counts span 40x across eras (1970s mean 127.6, 2020s 23.9)
+    # purely because older papers have had longer to accrue them, and salience
+    # is 3.0 + 0.1*citations. Dividing by age collapses that and reverses the
+    # direction, favouring current work.
+    #
+    # CRITICAL: this rewrites the ranking score only. Paper.salience itself is
+    # never modified, because author keyword scores -- and therefore user
+    # credibility -- are computed from the raw stored value
+    # (author_identification.calculate_merged_keywords). An age-adjusted
+    # salience must never reach that path.
+    #
+    # log1p keeps the multiplier bounded and matches the credibility idiom:
+    # a paper with no salience is not zeroed out, it simply gets no boost.
+    if candidate_saliences is not None and candidate_years is not None:
+        year_now = current_year if current_year is not None else datetime.date.today().year
+        years_arr = np.asarray(candidate_years, dtype=float)
+        sal_arr = np.maximum(np.asarray(candidate_saliences, dtype=float), 0.0)
+    
+        # Floor the age at 1 year: a paper published this year would otherwise
+        # divide by zero, and a part-year rate extrapolates from almost nothing.
+        ages = np.maximum(year_now - years_arr, 1.0)
+        recency = sal_arr / ages
+        age_factor = 1.0 + age_penalty_weight * np.log1p(recency)
+    
+        # A missing or nonsense year would otherwise read as maximally ancient
+        # and bury the paper. Unknown age means no opinion, not a penalty.
+        age_factor = np.where(years_arr > 0, age_factor, 1.0)
+        sims = sims * age_factor
+
     
     if candidate_credibilities is not None:
         creds = np.array(candidate_credibilities)
@@ -170,7 +214,13 @@ def recommend_topk(
 
             # Bounded log-credibility multiplier within this 15-paper tier
             tier_sims_pos = np.maximum(tier_sims, 0)
-            tier_scores = tier_sims_pos * (1.0 + 0.15 * np.log1p(np.maximum(tier_creds, 0)))
+            # `credibility_weight` was declared and documented but never read —
+            # the coefficient was hardcoded at 0.15, so the parameter silently did
+            # nothing. Default lowered from 0.2 to 0.15 to match what has actually
+            # been running; wiring it up must not change anyone's feed.
+            tier_scores = tier_sims_pos * (
+                1.0 + credibility_weight * np.log1p(np.maximum(tier_creds, 0))
+            )
 
             # Sort within tier descending by composite score
             sub_order = np.argsort(-tier_scores)
