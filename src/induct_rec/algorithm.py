@@ -133,7 +133,7 @@ def recommend_topk(
     candidate_credibilities: list[float] = None,
     credibility_weight: float = 0.15,
     candidate_saliences: list[float] = None,
-    age_penalty_weight: float = 0.5,
+    age_penalty_weight: float = 2.0,
     current_year: int = None,
     pool_size: int = 250
 ):
