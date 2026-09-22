@@ -49,29 +49,53 @@ class TestCredibilityReranking:
         assert recs[0][0] == 2
 
 
-class TestRecencyResort:
-    def test_topk_resorted_youngest_first(self):
-        """With candidate_years, the selected top-k is re-ordered newest-first."""
-        user = np.zeros(8, dtype=np.float32); user[0] = 1.0
-        # three clearly-positive candidates, descending similarity
-        cand = np.vstack([_vec_with_cosine(0.9), _vec_with_cosine(0.8), _vec_with_cosine(0.7)])
-        ids = [1, 2, 3]
-        years = [2010, 2024, 2018]
-        recs = recommend_topk(user, cand, ids, k=3, candidate_years=years)
-        # returned order must be by year desc: 2024(id2), 2018(id3), 2010(id1)
-        assert [r[0] for r in recs] == [2, 3, 1]
+class TestRecency:
+    """
+    Recency used to be a hard newest-first re-sort of the returned top-K. That
+    was dropped: it discarded score ordering wholesale inside the page, and it
+    could not survive the caller that matters. Induct's precompute job stores
+    only (paper_id, score) and the route re-reads ORDER BY score DESC, so any
+    ordering not encoded in the score evaporated — meaning the two
+    recommendation paths could never agree while it existed.
 
-    def test_recency_only_reorders_the_selected_topk(self):
-        """Recency re-sorts within the top-k, it doesn't pull in low-similarity
-        papers just because they're newer."""
+    Recency is carried by the age penalty instead, which is part of the score.
+    """
+
+    def test_results_come_back_in_score_order(self):
         user = np.zeros(8, dtype=np.float32); user[0] = 1.0
-        cand = np.vstack([_vec_with_cosine(0.9), _vec_with_cosine(0.85), _vec_with_cosine(0.1)])
-        ids = [1, 2, 3]
-        years = [2000, 2001, 2030]   # id3 is newest but least similar
-        recs = recommend_topk(user, cand, ids, k=2, candidate_years=years)
-        returned = {r[0] for r in recs}
-        assert 3 not in returned  # newest-but-irrelevant excluded from top-2
-        assert returned == {1, 2}
+        cand = np.vstack([_vec_with_cosine(0.9), _vec_with_cosine(0.8), _vec_with_cosine(0.7)])
+        recs = recommend_topk(user, cand, [1, 2, 3], k=3, candidate_years=[2010, 2024, 2018])
+        scores = [r[1] for r in recs]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_years_alone_do_not_reorder_anything(self):
+        """`candidate_years` is an age-penalty input; without salience it is inert."""
+        user = np.zeros(8, dtype=np.float32); user[0] = 1.0
+        cand = np.vstack([_vec_with_cosine(0.9), _vec_with_cosine(0.8), _vec_with_cosine(0.7)])
+        with_years = recommend_topk(user, cand, [1, 2, 3], k=3, candidate_years=[2010, 2024, 2018])
+        without = recommend_topk(user, cand, [1, 2, 3], k=3)
+        assert [r[0] for r in with_years] == [r[0] for r in without] == [1, 2, 3]
+
+    def test_the_age_penalty_is_what_promotes_recent_work(self):
+        user = np.zeros(8, dtype=np.float32); user[0] = 1.0
+        cand = np.vstack([_vec_with_cosine(0.9), _vec_with_cosine(0.8)])
+        recs = dict(recommend_topk(
+            user, cand, ["old", "new"], k=2,
+            candidate_years=[1980, 2026], candidate_credibilities=[0.0, 0.0],
+            candidate_saliences=[3.0, 3.0], current_year=2026,
+        ))
+        assert recs["new"] > recs["old"], "the newer, less similar paper should win"
+
+    def test_recency_does_not_resurrect_an_irrelevant_paper(self):
+        """A newer paper still has to be in the running on relevance."""
+        user = np.zeros(8, dtype=np.float32); user[0] = 1.0
+        cand = np.vstack([_vec_with_cosine(0.9), _vec_with_cosine(0.85), _vec_with_cosine(0.01)])
+        recs = recommend_topk(
+            user, cand, [1, 2, 3], k=2,
+            candidate_years=[2000, 2001, 2030], candidate_credibilities=[0.0, 0.0, 0.0],
+            candidate_saliences=[3.0, 3.0, 3.0], current_year=2026,
+        )
+        assert 3 not in {r[0] for r in recs}
 
 
 class TestSerializationRoundTrip:

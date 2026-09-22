@@ -140,7 +140,7 @@ def recommend_topk(
     """
     Fast vectorized cosine similarity with optional credibility re-ranking.
     Everything is assumed to be normalized, so similarity is dot product.
-    If candidate_years is provided, the top K results are sorted from youngest to oldest.
+    `candidate_years` feeds the age penalty; results are returned in score order.
     """
     if candidate_vecs.size == 0:
         return []
@@ -236,12 +236,15 @@ def recommend_topk(
         top_idx = top_idx[np.argsort(-sims[top_idx])]
         returned_scores = sims[top_idx]
     
-    if candidate_years is not None:
-        results = [(candidate_ids[i], float(returned_scores[idx]), candidate_years[i]) for idx, i in enumerate(top_idx)]
-        # Sort by year (descending), then by score (descending)
-        results.sort(key=lambda x: (-x[2], -x[1]))
-        return [(r[0], r[1]) for r in results]
-
+    # Results come back in score order, always.
+    #
+    # There used to be a hard newest-first re-sort of the top K here whenever
+    # candidate_years was supplied. It was dropped for two reasons. It threw
+    # away the score ordering wholesale inside the returned page, and it could
+    # not survive the precompute path at all — that stores only (paper_id,
+    # score) and the route re-reads ORDER BY score DESC, so any ordering not
+    # encoded in the score evaporated. Recency is now carried by the age
+    # penalty above, which *is* in the score, so both paths agree.
     return [(candidate_ids[i], float(returned_scores[idx])) for idx, i in enumerate(top_idx)]
 
 def serialize_embedding(v: np.ndarray) -> bytes:
