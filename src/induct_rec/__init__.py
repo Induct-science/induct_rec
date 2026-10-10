@@ -1,5 +1,7 @@
 from .algorithm import (
     build_user_profile_vec,
+    rank_candidates,
+    mmr_select,
     recommend_topk,
     embed_text,
     embed_paper,
@@ -11,6 +13,8 @@ from .algorithm import (
 
 __all__ = [
     "build_user_profile_vec",
+    "rank_candidates",
+    "mmr_select",
     "recommend_topk",
     "embed_text",
     "embed_paper",
