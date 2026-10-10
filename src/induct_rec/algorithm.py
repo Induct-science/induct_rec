@@ -80,23 +80,69 @@ def normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     return v if n == 0 else (v / n)
 
+#: Half-life, in years, for weighting a researcher's own papers when building
+#: their profile vector. A paper this many years old counts half as much as one
+#: from the current year.
+#:
+#: ``None`` means an unweighted mean — every paper the researcher has ever
+#: written pulls equally, which is the behaviour this module shipped with. That
+#: is wrong for anyone whose interests moved: a physical oceanographer who spent
+#: three years on sea ice a decade ago is still recommended sea ice at full
+#: strength today.
+#:
+#: Left at ``None`` deliberately. Turning it on changes every feed, so it is a
+#: decision to make after looking at real feeds — ``tools/rec_variants.py
+#: --recency-halflife N`` in induct_be prints them. 4-5 years is the range worth
+#: starting from: long enough that a productive researcher's current programme
+#: dominates, short enough that one quiet year does not erase them.
+DEFAULT_RECENCY_HALFLIFE_YEARS = None
+
+
 def build_user_profile_vec(
-    user_papers_data: list[tuple[str, str]],
+    user_papers_data: list[tuple],
     keyword_weights: dict[str, float],
     alpha: float = 0.7,
+    recency_halflife_years: float | None = DEFAULT_RECENCY_HALFLIFE_YEARS,
+    current_year: int | None = None,
 ) -> np.ndarray:
     """
     alpha near 1.0 = mostly based on user's papers
     alpha near 0.0 = mostly based on keywords
+
+    `user_papers_data` holds (title, abstract) or (title, abstract, year). The
+    two forms may be mixed; a 2-tuple simply carries no year.
+
+    `recency_halflife_years` weights each paper by ``0.5 ** (age / halflife)``
+    so the profile tracks what someone works on *now* rather than everything
+    they have ever published. ``None`` keeps the unweighted mean.
+
+    A paper with no usable year gets weight 1.0 — treated as current rather
+    than as maximally old. That matches `recommend_topk`, which sets
+    ``age_factor = 1.0`` for unknown years on the same reasoning: an unknown
+    date is an absence of evidence, not evidence of age. It does mean a corpus
+    with many missing years dilutes the effect rather than skewing it.
     """
-    # 1) Paper component (mean of user paper embeddings)
+    # 1) Paper component (recency-weighted mean of user paper embeddings)
     if user_papers_data:
-        texts = [paper_text(t, a) for (t, a) in user_papers_data]
+        texts = [paper_text(row[0], row[1]) for row in user_papers_data]
         vecs = get_model().encode(texts, convert_to_numpy=True)
         norms = np.linalg.norm(vecs, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         paper_vecs = vecs / norms
-        paper_profile = np.mean(paper_vecs, axis=0)
+
+        if recency_halflife_years and recency_halflife_years > 0:
+            year_now = current_year if current_year is not None else datetime.date.today().year
+            years = [row[2] if len(row) > 2 else None for row in user_papers_data]
+            w = np.array([
+                1.0 if (y is None or y <= 0)
+                else 0.5 ** (max(year_now - int(y), 0) / float(recency_halflife_years))
+                for y in years
+            ], dtype=float)
+            total = w.sum()
+            paper_profile = ((paper_vecs * w[:, None]).sum(axis=0) / total
+                             if total > 0 else np.mean(paper_vecs, axis=0))
+        else:
+            paper_profile = np.mean(paper_vecs, axis=0)
     else:
         paper_profile = None
 
@@ -255,3 +301,188 @@ def deserialize_embedding(b: bytes) -> np.ndarray:
     """Deserializes bytes back to a numpy array."""
     # all-MiniLM-L6-v2 produces float32 vectors of dimension 384
     return np.frombuffer(b, dtype=np.float32)
+
+
+def mmr_select(scores, vecs, k, lam=0.7):
+    """
+    Pick `k` items by Maximal Marginal Relevance.
+
+    Greedy: take the highest-scoring item, then repeatedly take whichever
+    remaining item maximises
+
+        lam * score - (1 - lam) * max_similarity_to_already_picked
+
+    The second term is the whole point. Once a paper on mesoscale eddies is
+    chosen, every other mesoscale-eddy paper is penalised in proportion to how
+    much it resembles it, so a feed of eight near-duplicates from one group
+    becomes one of them plus seven other things worth seeing. `lam = 1.0` is
+    pure relevance, i.e. no diversification.
+
+    Cost is O(k * n) dot products on an already-shortlisted pool, so it is
+    negligible next to retrieval.
+
+    Returns indices into `scores`, in selection order.
+    """
+    n = len(scores)
+    if n == 0 or k <= 0:
+        return []
+    k = min(k, n)
+    if lam >= 1.0:
+        return list(np.argsort(-np.asarray(scores))[:k])
+
+    scores = np.asarray(scores, dtype=float)
+    # Diversity is measured on the similarity scale, so put relevance there too;
+    # otherwise lam is comparing a score of ~8 against a cosine of ~0.8 and the
+    # penalty never bites.
+    span = float(scores.max() - scores.min())
+    rel = (scores - scores.min()) / span if span > 0 else np.zeros_like(scores)
+
+    chosen = [int(np.argmax(scores))]
+    best_sim = vecs @ vecs[chosen[0]]
+    for _ in range(k - 1):
+        marginal = lam * rel - (1.0 - lam) * best_sim
+        marginal[chosen] = -np.inf
+        nxt = int(np.argmax(marginal))
+        if not np.isfinite(marginal[nxt]):
+            break
+        chosen.append(nxt)
+        best_sim = np.maximum(best_sim, vecs @ vecs[nxt])
+    return chosen
+
+
+def rank_candidates(
+    user_vec,
+    candidate_vecs,
+    candidate_ids,
+    *,
+    k: int = 10,
+    candidate_years=None,
+    candidate_credibilities=None,
+    candidate_saliences=None,
+    candidate_is_induct=None,
+    min_similarity: float | None = None,
+    scoring: str = "salience_age",
+    age_penalty_weight: float = 2.0,
+    recency_weight: float = 2.0,
+    credibility_weight: float = 0.15,
+    induct_boost: float = 1.0,
+    mmr_lambda: float = 1.0,
+    rerank_fn=None,
+    rerank_top_n: int = 100,
+):
+    """
+    The full recommendation pipeline, in one place, with explicit stages.
+
+    Exists because `recommend_topk` fuses retrieval, scoring and tiering into
+    one pass, which left no seam for a similarity gate, for diversification, or
+    for a future cross-encoder. It also made a real failure hard to see: on
+    2026-10-08 the ERA-Interim reanalysis paper (cosine 0.530 to the reader)
+    topped an abyssal-turbulence researcher's feed, beating Large et al. 1994 at
+    cosine 0.775, because salience/age of 176 citations a year outweighed a 46%
+    deficit in topical fit. Nothing was wrong with the weights; the candidate
+    pool was the entire corpus, so a paper that resembles all of climate science
+    was allowed to compete.
+
+    Stages, in this order, and the order matters:
+
+      1. similarity      cosine against the reader's profile vector
+      2. gate            drop everything below `min_similarity` — the pool gate
+      3. rerank (opt)    `rerank_fn` may replace relevance for the top
+                         `rerank_top_n`; this is the cross-encoder seam
+      4. score           relevance x recency x credibility x Induct boost
+      5. diversify       MMR picks the final `k`
+
+    **Scoring must precede MMR, not follow it.** Whatever runs last decides the
+    order, so ranking by credibility after diversifying would re-sort the list
+    and undo the spacing MMR just created.
+
+    `scoring` selects the recency term:
+      "salience_age" — (1 + w*log1p(salience/age)), the existing behaviour.
+         Self-reinforcing: recommendation drives reads, reads drive salience.
+      "recency"      — (1 + w*log1p(1/age)), no salience at all. Prefers a very
+         relevant paper from this year over a famous one from 2011.
+      "none"         — no recency term.
+
+    Returns [(paper_id, score)] with **strictly decreasing** scores. That is not
+    cosmetic: the precompute path stores only (paper_id, score) and the serving
+    route re-reads ORDER BY score DESC, so any ordering not encoded in the score
+    is lost. An earlier newest-first re-sort was dropped for exactly that
+    reason, and MMR's selection order would evaporate the same way.
+    """
+    import datetime as _dt
+
+    user_vec = np.asarray(user_vec, dtype=float)
+    V = np.asarray(candidate_vecs, dtype=float)
+    if V.size == 0:
+        return []
+
+    n = V.shape[0]
+    sims = V @ user_vec
+    idx = np.arange(n)
+
+    # --- 2. the pool gate -------------------------------------------------
+    if min_similarity is not None:
+        keep = sims >= min_similarity
+        # Never hand a reader an empty feed because their profile is unusual.
+        # Falling back to the nearest candidates keeps the gate a preference
+        # rather than a cliff.
+        if keep.sum() >= k:
+            idx = idx[keep]
+        else:
+            idx = np.argsort(-sims)[: max(k, min(n, k))]
+
+    rel = sims[idx]
+
+    # --- 3. the cross-encoder seam ---------------------------------------
+    # A cross-encoder scores (reader, paper) pairs jointly and cannot be
+    # precomputed, so it is affordable in the nightly job and not in a request.
+    # It plugs in here, over the shortlist only, and must return one relevance
+    # value per id it was given.
+    if rerank_fn is not None and len(idx) > 0:
+        order = np.argsort(-rel)[:rerank_top_n]
+        subset_ids = [candidate_ids[i] for i in idx[order]]
+        new_rel = rerank_fn(subset_ids, rel[order])
+        if new_rel is not None:
+            rel = rel.copy()
+            rel[order] = np.asarray(new_rel, dtype=float)
+
+    # --- 4. scoring -------------------------------------------------------
+    year_now = _dt.date.today().year
+    factor = np.ones_like(rel)
+
+    if scoring in ("salience_age", "recency") and candidate_years is not None:
+        years = np.asarray([candidate_years[i] or 0 for i in idx], dtype=float)
+        ages = np.maximum(year_now - years, 1.0)
+        if scoring == "salience_age" and candidate_saliences is not None:
+            sal = np.maximum(np.asarray([candidate_saliences[i] or 0.0 for i in idx],
+                                        dtype=float), 0.0)
+            f = 1.0 + age_penalty_weight * np.log1p(sal / ages)
+        else:
+            f = 1.0 + recency_weight * np.log1p(1.0 / ages)
+        # Unknown year means no opinion, not maximal age.
+        factor = factor * np.where(years > 0, f, 1.0)
+
+    if candidate_credibilities is not None:
+        creds = np.maximum(np.asarray([candidate_credibilities[i] or 0.0 for i in idx],
+                                      dtype=float), 0.0)
+        factor = factor * (1.0 + credibility_weight * np.log1p(creds))
+
+    if candidate_is_induct is not None and induct_boost != 1.0:
+        is_ind = np.asarray([bool(candidate_is_induct[i]) for i in idx])
+        factor = factor * np.where(is_ind, induct_boost, 1.0)
+
+    scores = rel * factor
+
+    # --- 5. diversify -----------------------------------------------------
+    picked = mmr_select(scores, V[idx], k, lam=mmr_lambda)
+    out_ids = [candidate_ids[idx[p]] for p in picked]
+    out_scores = [float(scores[p]) for p in picked]
+
+    # Enforce strictly decreasing scores so ORDER BY score DESC reproduces this
+    # exact order downstream. MMR's marginal scores are near-monotone but not
+    # guaranteed so, and equal scores would re-sort arbitrarily.
+    for i in range(1, len(out_scores)):
+        if out_scores[i] >= out_scores[i - 1]:
+            out_scores[i] = out_scores[i - 1] - 1e-9
+
+    return list(zip(out_ids, out_scores))
