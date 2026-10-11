@@ -15,7 +15,9 @@ similarity and enormous salience, the rest are close to the reader.
 import numpy as np
 import pytest
 
-from induct_rec.algorithm import mmr_select, rank_candidates
+from induct_rec.algorithm import (
+    DEFAULT_SLOT_PATTERN, mmr_select, rank_candidates, select_with_quota,
+)
 
 
 OFFTOPIC, CLASSIC, RECENT, NEWEST = 30993, 1, 2, 3
@@ -145,3 +147,137 @@ class TestCrossEncoderSeam:
         out = _ids(rank_candidates(k=3, min_similarity=0.6,
                                    rerank_fn=lambda ids, rel: None, **feed))
         assert out == baseline
+
+
+class TestInductSlotReservation:
+    """
+    Visibility as part of the gatekeeping mechanism.
+
+    A paper published on Induct needs established peers to review it, read it,
+    or ignore it, and that verdict decides whether it publishes. None of those
+    can happen to a paper nobody is shown — and a new Induct paper has
+    credibility 0 and salience 0, so it loses to established literature at any
+    plausible `induct_boost`. Reserving slots is the only mechanism that
+    actually reaches readers.
+
+    What reservation must NOT do is lower the relevance bar. Everything here is
+    scored by the same formula and gated on the same similarity floor; only
+    placement differs.
+    """
+
+    @pytest.fixture
+    def mixed(self):
+        """
+        Enough of each kind to fill the pattern exactly: eight strong external
+        papers, three brand-new Induct papers for slots 3/5/7, and two
+        established Induct papers for slots 9/10. Sized this way so the test
+        reads the pattern rather than the cascade — the cascade has its own test.
+        """
+        user = np.array([1.0, 0.0, 0.0]); user /= np.linalg.norm(user)
+        rows, creds, induct = [], [], []
+        for i in range(8):                       # external, high similarity
+            rows.append([0.95 - i * 0.01, 0.1, 0.0]); creds.append(200.0); induct.append(False)
+        for i in range(3):                       # Induct, brand new
+            rows.append([0.70 - i * 0.01, 0.4, 0.0]); creds.append(0.0); induct.append(True)
+        for i in range(2):                       # Induct, established
+            rows.append([0.80 - i * 0.01, 0.3, 0.0]); creds.append(150.0); induct.append(True)
+        V = np.asarray(rows, dtype=float)
+        V /= np.linalg.norm(V, axis=1, keepdims=True)
+        n = len(creds)
+        return dict(user_vec=user, candidate_vecs=V,
+                    candidate_ids=list(range(n)),
+                    candidate_years=[2024] * n,
+                    candidate_credibilities=creds,
+                    candidate_is_induct=induct)
+
+    def _kw(self, **over):
+        kw = dict(scoring="none", min_similarity=None, mmr_lambda=1.0,
+                  slot_pattern=DEFAULT_SLOT_PATTERN, induct_low_credibility_max=0.0)
+        kw.update(over)
+        return kw
+
+    def test_without_reservation_induct_papers_are_buried(self, mixed):
+        """The baseline this exists to fix."""
+        out = [i for i, _ in rank_candidates(k=6, **dict(
+            scoring="none", min_similarity=None, mmr_lambda=1.0), **mixed)]
+        assert all(i < 8 for i in out), out
+
+    def test_reservation_surfaces_them(self, mixed):
+        out = [i for i, _ in rank_candidates(k=10, **self._kw(), **mixed)]
+        induct_positions = [pos for pos, i in enumerate(out, 1) if mixed["candidate_is_induct"][i]]
+        assert induct_positions == [3, 5, 7, 9, 10], out
+
+    def test_positions_one_and_two_are_never_reserved(self, mixed):
+        """
+        The two most visible slots go to the best papers. An Induct paper takes
+        them when it genuinely wins; reserving them would promote a worse paper
+        exactly where it is most obvious.
+        """
+        out = [i for i, _ in rank_candidates(k=10, **self._kw(), **mixed)]
+        assert not mixed["candidate_is_induct"][out[0]]
+        assert not mixed["candidate_is_induct"][out[1]]
+
+    def test_low_slots_come_before_high_slots(self, mixed):
+        """Positions 3, 5, 7 prefer low credibility; 9 and 10 prefer high."""
+        out = [i for i, _ in rank_candidates(k=10, **self._kw(), **mixed)]
+        creds = mixed["candidate_credibilities"]
+        lows = [p for p, i in enumerate(out, 1) if mixed["candidate_is_induct"][i] and creds[i] == 0.0]
+        highs = [p for p, i in enumerate(out, 1) if mixed["candidate_is_induct"][i] and creds[i] > 0.0]
+        assert lows == [3, 5, 7], lows
+        assert highs == [9, 10], highs
+
+    def test_low_slots_cascade_to_high_before_open(self, mixed):
+        """
+        A low slot prefers a low-credibility Induct paper, then any Induct
+        paper, and only then the open pool. With no low-credibility papers the
+        low slots must still go to Induct work rather than to the open pool.
+        """
+        creds = list(mixed["candidate_credibilities"])
+        for i in (8, 9, 10):                  # make every "new" Induct paper established
+            creds[i] = 150.0
+        no_low = dict(mixed, candidate_credibilities=creds)
+        out = [i for i, _ in rank_candidates(k=10, **self._kw(), **no_low)]
+        assert no_low["candidate_is_induct"][out[2]], "position 3 should cascade to an Induct paper"
+
+    def test_no_paper_is_chosen_twice(self, mixed):
+        out = [i for i, _ in rank_candidates(k=12, **self._kw(), **mixed)]
+        assert len(out) == len(set(out)), out
+
+    def test_the_window_repeats(self, mixed):
+        """Position 13 behaves like 3: the pattern is a repeating window."""
+        rows = list(mixed["candidate_vecs"])
+        creds = list(mixed["candidate_credibilities"])
+        induct = list(mixed["candidate_is_induct"])
+        for i in range(8):                    # more low-credibility Induct papers
+            rows.append([0.68 - i * 0.01, 0.45, 0.0]); creds.append(0.0); induct.append(True)
+        V = np.asarray(rows, dtype=float); V /= np.linalg.norm(V, axis=1, keepdims=True)
+        wide = dict(mixed, candidate_vecs=V, candidate_credibilities=creds,
+                    candidate_is_induct=induct,
+                    candidate_ids=list(range(len(creds))),
+                    candidate_years=[2024] * len(creds))
+        out = [i for i, _ in rank_candidates(k=14, **self._kw(), **wide)]
+        assert wide["candidate_is_induct"][out[12]], "position 13 should be reserved like position 3"
+
+    def test_empty_streams_fall_through_rather_than_padding(self, mixed):
+        """
+        With no Induct papers at all, the page must be exactly what the
+        universal ranking produced — reservation never pads a feed.
+        """
+        n = len(mixed["candidate_ids"])
+        no_induct = dict(mixed, candidate_is_induct=[False] * n)
+        reserved = [i for i, _ in rank_candidates(k=6, **self._kw(), **no_induct)]
+        plain = [i for i, _ in rank_candidates(k=6, **dict(
+            scoring="none", min_similarity=None, mmr_lambda=1.0), **no_induct)]
+        assert reserved == plain
+
+    def test_the_gate_still_applies_to_reserved_slots(self, mixed):
+        """
+        Reservation must not become a bypass. An Induct paper below the
+        similarity floor stays out however many slots are free.
+        """
+        far = dict(mixed)
+        V = np.array(far["candidate_vecs"], copy=True)
+        V[8] = np.array([0.1, 0.99, 0.0]); V[8] /= np.linalg.norm(V[8])
+        far["candidate_vecs"] = V
+        out = [i for i, _ in rank_candidates(k=10, **self._kw(min_similarity=0.5), **far)]
+        assert 8 not in out, out

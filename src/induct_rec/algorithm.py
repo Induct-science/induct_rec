@@ -367,6 +367,8 @@ def rank_candidates(
     credibility_weight: float = 0.15,
     induct_boost: float = 1.0,
     mmr_lambda: float = 1.0,
+    induct_low_credibility_max: float | None = None,
+    slot_pattern=None,
     rerank_fn=None,
     rerank_top_n: int = 100,
 ):
@@ -473,8 +475,37 @@ def rank_candidates(
 
     scores = rel * factor
 
-    # --- 5. diversify -----------------------------------------------------
-    picked = mmr_select(scores, V[idx], k, lam=mmr_lambda)
+    # --- 5. diversify, and reserve slots for Induct papers ----------------
+    #
+    # Scoring above is universal: an Induct paper and an external paper are
+    # judged by the same formula against the same similarity gate. Reservation
+    # changes only *placement*, among papers that already qualified — a
+    # reserved slot cannot surface an irrelevant paper, because an irrelevant
+    # one was dropped at the gate.
+    #
+    # Why reserve at all: a paper published here needs established peers to
+    # review it, read it, or ignore it, and that verdict is what decides
+    # whether it publishes. None of those can happen to a paper nobody is
+    # shown. Visibility is therefore part of the gatekeeping mechanism, not a
+    # thumb on the scale — and it is what the `induct_boost` multiplier could
+    # not deliver, since a new paper has credibility 0 and salience 0 and loses
+    # to established literature at any plausible multiplier.
+    if slot_pattern is not None and candidate_is_induct is not None:
+        creds_for_stream = (
+            [candidate_credibilities[i] or 0.0 for i in idx]
+            if candidate_credibilities is not None else [0.0] * len(idx)
+        )
+        low_max = (induct_low_credibility_max
+                   if induct_low_credibility_max is not None else 0.0)
+        streams = [
+            (STREAM_OPEN if not candidate_is_induct[i]
+             else (STREAM_INDUCT_LOW if c <= low_max else STREAM_INDUCT_HIGH))
+            for i, c in zip(idx, creds_for_stream)
+        ]
+        picked = select_with_quota(scores, V[idx], streams, k,
+                                   lam=mmr_lambda, pattern=slot_pattern)
+    else:
+        picked = mmr_select(scores, V[idx], k, lam=mmr_lambda)
     out_ids = [candidate_ids[idx[p]] for p in picked]
     out_scores = [float(scores[p]) for p in picked]
 
@@ -486,3 +517,124 @@ def rank_candidates(
             out_scores[i] = out_scores[i - 1] - 1e-9
 
     return list(zip(out_ids, out_scores))
+
+
+#: Streams a candidate can belong to, for slot reservation.
+STREAM_OPEN = 0        #: anything — filled by the universal ranking
+STREAM_INDUCT_LOW = 1  #: an Induct paper whose credibility is still low
+STREAM_INDUCT_HIGH = 2 #: an Induct paper that has accrued credibility
+
+#: What each position of the 10-slot window may be filled by, in preference
+#: order. An empty tuple means **open**: the best remaining paper of any kind,
+#: Induct included.
+#:
+#: Set by Bryan on 2026-10-11. Five positions open, three preferring
+#: low-credibility Induct papers, two preferring high-credibility ones. The
+#: window repeats: position 11 behaves like position 1, 12 like 2, and so on.
+#:
+#: Positions 1 and 2 are open so the two most visible slots always go to the
+#: best papers available — an Induct paper takes them when it genuinely wins,
+#: and reserving them would promote a worse paper where it is most obvious.
+#:
+#: The low-credibility slots **cascade**: low first, then high-credibility
+#: Induct, then open. A newly submitted paper has no other route to a reader,
+#: so its slots are tried first; but if there are none, the slot goes to another
+#: Induct paper before it goes to the open pool. The high slots fall straight
+#: through to open, because high-credibility Induct papers can also compete in
+#: the open positions on merit.
+DEFAULT_SLOT_PATTERN = (
+    (),                                      # 1  open
+    (),                                      # 2  open
+    (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 3
+    (),                                      # 4  open
+    (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 5
+    (),                                      # 6  open
+    (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 7
+    (),                                      # 8  open
+    (STREAM_INDUCT_HIGH,),                   # 9
+    (STREAM_INDUCT_HIGH,),                   # 10
+)
+
+
+def _slot_preferences(slot):
+    """
+    Normalise one pattern entry to a tuple of streams, in preference order.
+
+    Accepts an empty tuple or None for "open", a bare stream constant for a
+    single preference, or a tuple for a cascade. The lenient forms exist so a
+    hand-written pattern in a config or a test cannot silently mean the wrong
+    thing.
+    """
+    if slot is None:
+        return ()
+    if isinstance(slot, (tuple, list)):
+        return tuple(slot)
+    return (slot,)
+
+
+def select_with_quota(scores, vecs, streams, k, *, lam=0.8, pattern=DEFAULT_SLOT_PATTERN):
+    """
+    Choose `k` items, reserving slots for particular streams, with MMR inside.
+
+    One ranking, one set of rules. Every candidate — Induct or external — is
+    scored by the same formula and has to clear the same similarity gate; this
+    step only decides *placement* among papers that already qualified. A
+    reserved slot can never be filled by an irrelevant paper, because an
+    irrelevant paper was removed before this function ever sees it.
+
+    Each position carries a preference order (see `DEFAULT_SLOT_PATTERN`). The
+    first preferred stream with anything left wins the slot; when every
+    preference is exhausted the slot falls through to the best remaining
+    candidate of any kind. So a feed is never padded: with no Induct papers
+    worth showing, the page is exactly what the universal ranking produced.
+
+    The pattern repeats every `len(pattern)` positions, and a paper already
+    chosen is never offered again — within a page by construction here, and
+    across pages because the callers exclude what they have already served.
+
+    "Best" means the MMR marginal score, so diversification still applies
+    *within* a stream — three reserved slots do not become three papers from
+    the same group.
+
+    Returns indices into `scores`, in output order.
+    """
+    n = len(scores)
+    if n == 0 or k <= 0:
+        return []
+    k = min(k, n)
+
+    scores = np.asarray(scores, dtype=float)
+    streams = np.asarray(streams, dtype=int)
+
+    span = float(scores.max() - scores.min())
+    rel = (scores - scores.min()) / span if span > 0 else np.zeros_like(scores)
+
+    chosen: list[int] = []
+    best_sim = np.zeros(n, dtype=float)
+    taken = np.zeros(n, dtype=bool)
+
+    for pos in range(k):
+        prefs = _slot_preferences(pattern[pos % len(pattern)]) if pattern else ()
+
+        marginal = lam * rel - (1.0 - lam) * best_sim
+        marginal = np.where(taken, -np.inf, marginal)
+
+        # Try each preferred stream in order; fall through to open only after
+        # every preference is exhausted. `taken` is what guarantees no paper is
+        # ever chosen twice, whichever stream offers it.
+        pick = None
+        for want in prefs:
+            eligible = np.where((streams == want) & ~taken, marginal, -np.inf)
+            if np.isfinite(eligible.max()):
+                pick = int(np.argmax(eligible))
+                break
+        if pick is None:
+            if not np.isfinite(marginal.max()):
+                break
+            pick = int(np.argmax(marginal))
+
+        chosen.append(pick)
+        taken[pick] = True
+        best_sim = np.maximum(best_sim, vecs @ vecs[pick])
+
+    return chosen
