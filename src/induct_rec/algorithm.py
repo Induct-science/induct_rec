@@ -523,6 +523,22 @@ def rank_candidates(
 STREAM_OPEN = 0        #: anything — filled by the universal ranking
 STREAM_INDUCT_LOW = 1  #: an Induct paper whose credibility is still low
 STREAM_INDUCT_HIGH = 2 #: an Induct paper that has accrued credibility
+#: An Induct paper whose authors asked *this* reader to review it.
+#:
+#: A request is a signal inside the ranking, never an override of it. A
+#: requested candidate must already have cleared the similarity gate to be in
+#: the candidate set at all, so this stream can only reorder papers the reader
+#: was eligible to see anyway — it cannot put an off-topic paper in a feed,
+#: whoever asked. See Part V-C of CONSTITUTION.md.
+STREAM_INDUCT_REQUESTED = 3
+
+#: The ceiling on how much of one reader's attention the request mechanism may
+#: claim: at most this many of the ten positions may prefer
+#: STREAM_INDUCT_REQUESTED. A property of the feed rather than a per-requester
+#: quota, so it holds however many people are asking. Enforced by
+#: `validate_slot_pattern`, which `DEFAULT_SLOT_PATTERN` is checked against at
+#: import.
+MAX_REQUESTED_SLOTS = 3
 
 #: What each position of the 10-slot window may be filled by, in preference
 #: order. An empty tuple means **open**: the best remaining paper of any kind,
@@ -542,18 +558,51 @@ STREAM_INDUCT_HIGH = 2 #: an Induct paper that has accrued credibility
 #: Induct paper before it goes to the open pool. The high slots fall straight
 #: through to open, because high-credibility Induct papers can also compete in
 #: the open positions on merit.
+#: Requested papers lead the cascade in the three low-credibility positions and
+#: nowhere else, which is what holds the request mechanism to three of ten.
+#: Positions 9 and 10 stay closed to requests: those are for Induct papers that
+#: earned credibility, and letting a request take them would let an author buy a
+#: position that is supposed to be won.
+#:
+#: Because `requested` leads a *cascade*, behaviour is unchanged when nobody has
+#: requested anything — the slot falls through to low, then high, then open,
+#: exactly as before.
 DEFAULT_SLOT_PATTERN = (
     (),                                      # 1  open
     (),                                      # 2  open
-    (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 3
+    (STREAM_INDUCT_REQUESTED,
+     STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 3
     (),                                      # 4  open
-    (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 5
+    (STREAM_INDUCT_REQUESTED,
+     STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 5
     (),                                      # 6  open
-    (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 7
+    (STREAM_INDUCT_REQUESTED,
+     STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), # 7
     (),                                      # 8  open
     (STREAM_INDUCT_HIGH,),                   # 9
     (STREAM_INDUCT_HIGH,),                   # 10
 )
+
+
+def validate_slot_pattern(pattern=None):
+    """
+    Check a slot pattern against the request ceiling. Returns the pattern.
+
+    Raises ValueError if more than `MAX_REQUESTED_SLOTS` of its positions would
+    accept a requested paper. `DEFAULT_SLOT_PATTERN` is validated at import, and
+    any pattern coming from configuration should be passed through here, because
+    the ceiling is the only thing standing between "authors may signal" and
+    "authors may fill an expert's feed".
+    """
+    pattern = DEFAULT_SLOT_PATTERN if pattern is None else pattern
+    n = sum(1 for slot in pattern
+            if STREAM_INDUCT_REQUESTED in _slot_preferences(slot))
+    if n > MAX_REQUESTED_SLOTS:
+        raise ValueError(
+            f"slot pattern allocates {n} positions to requested papers; "
+            f"MAX_REQUESTED_SLOTS is {MAX_REQUESTED_SLOTS}"
+        )
+    return pattern
 
 
 def _slot_preferences(slot):
@@ -570,6 +619,13 @@ def _slot_preferences(slot):
     if isinstance(slot, (tuple, list)):
         return tuple(slot)
     return (slot,)
+
+
+# Fail at import rather than at serve time: a pattern that over-allocates to
+# requests is a policy breach, and discovering it from a reader's feed would
+# mean it had already happened. Placed here because it needs
+# `_slot_preferences`, defined above.
+validate_slot_pattern(DEFAULT_SLOT_PATTERN)
 
 
 def select_with_quota(scores, vecs, streams, k, *, lam=0.8, pattern=DEFAULT_SLOT_PATTERN):

@@ -16,7 +16,9 @@ import numpy as np
 import pytest
 
 from induct_rec.algorithm import (
-    DEFAULT_SLOT_PATTERN, mmr_select, rank_candidates, select_with_quota,
+    DEFAULT_SLOT_PATTERN, MAX_REQUESTED_SLOTS, STREAM_INDUCT_HIGH,
+    STREAM_INDUCT_LOW, STREAM_INDUCT_REQUESTED, _slot_preferences, mmr_select,
+    rank_candidates, select_with_quota, validate_slot_pattern,
 )
 
 
@@ -281,3 +283,104 @@ class TestInductSlotReservation:
         far["candidate_vecs"] = V
         out = [i for i, _ in rank_candidates(k=10, **self._kw(min_similarity=0.5), **far)]
         assert 8 not in out, out
+
+
+class TestRequestedSlots:
+    """
+    A review request is a signal inside the ranking, never an override of it
+    (CONSTITUTION.md Part V-C). Three things must hold, and the third is the one
+    the whole design rests on:
+
+      * a requested paper leads the cascade in the three low-credibility
+        positions, so an author's signal is worth something;
+      * it is confined to those three of ten, so the mechanism can never claim
+        more than a bounded share of one expert's attention;
+      * it buys nothing at all below the similarity gate, so no amount of
+        requesting puts an off-topic paper in front of anybody.
+    """
+
+    def test_the_default_pattern_allocates_exactly_three(self):
+        eligible = [pos for pos, slot in enumerate(DEFAULT_SLOT_PATTERN, 1)
+                    if STREAM_INDUCT_REQUESTED in _slot_preferences(slot)]
+        assert eligible == [3, 5, 7]
+        assert len(eligible) == MAX_REQUESTED_SLOTS
+
+    def test_the_earned_positions_stay_closed_to_requests(self):
+        """
+        9 and 10 are for Induct papers that accrued credibility. A request must
+        not be able to buy a position that is supposed to be won.
+        """
+        for pos in (9, 10):
+            prefs = _slot_preferences(DEFAULT_SLOT_PATTERN[pos - 1])
+            assert STREAM_INDUCT_REQUESTED not in prefs
+
+    def test_an_over_allocating_pattern_is_refused(self):
+        with pytest.raises(ValueError, match="MAX_REQUESTED_SLOTS"):
+            validate_slot_pattern(((STREAM_INDUCT_REQUESTED,),) * (MAX_REQUESTED_SLOTS + 1))
+
+    def test_the_default_pattern_is_valid(self):
+        assert validate_slot_pattern(DEFAULT_SLOT_PATTERN) is DEFAULT_SLOT_PATTERN
+
+    def _streams(self, requested_idx=(), low_idx=(), high_idx=(), n=12):
+        s = np.zeros(n, dtype=int)
+        for i in low_idx:
+            s[i] = STREAM_INDUCT_LOW
+        for i in high_idx:
+            s[i] = STREAM_INDUCT_HIGH
+        for i in requested_idx:
+            s[i] = STREAM_INDUCT_REQUESTED
+        return s
+
+    def test_a_requested_paper_takes_the_slot_ahead_of_an_unrequested_one(self):
+        """
+        Same scores, same stream position — the only difference is that one was
+        requested. It must win position 3.
+        """
+        n = 12
+        scores = np.linspace(1.0, 0.0, n)
+        vecs = np.eye(n)                       # mutually orthogonal: MMR is inert
+        streams = self._streams(requested_idx=(11,), low_idx=(10,), n=n)
+        out = select_with_quota(scores, vecs, streams, k=3)
+        assert out[2] == 11, out
+
+    def test_the_cascade_is_unchanged_when_nothing_is_requested(self):
+        """
+        `requested` leads a cascade rather than replacing it, so a feed with no
+        requests must behave exactly as it did before the stream existed.
+        """
+        n = 12
+        scores = np.linspace(1.0, 0.0, n)
+        vecs = np.eye(n)
+        streams = self._streams(low_idx=(9, 10, 11), n=n)
+        with_requested = select_with_quota(scores, vecs, streams, k=10)
+        legacy_pattern = (
+            (), (),
+            (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), (),
+            (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), (),
+            (STREAM_INDUCT_LOW, STREAM_INDUCT_HIGH), (),
+            (STREAM_INDUCT_HIGH,), (STREAM_INDUCT_HIGH,),
+        )
+        before = select_with_quota(scores, vecs, streams, k=10, pattern=legacy_pattern)
+        assert with_requested == before
+
+    def test_a_fourth_requested_paper_cannot_claim_a_fourth_slot(self):
+        """
+        The ceiling, demonstrated rather than asserted about the pattern: with
+        four requested papers competing, only three may be placed inside one
+        ten-position window.
+        """
+        n = 14
+        scores = np.linspace(1.0, 0.0, n)
+        vecs = np.eye(n)
+        streams = self._streams(requested_idx=(10, 11, 12, 13), n=n)
+        out = select_with_quota(scores, vecs, streams, k=10)
+        placed = [i for i in out if streams[i] == STREAM_INDUCT_REQUESTED]
+        assert len(placed) == MAX_REQUESTED_SLOTS, placed
+
+    def test_requests_do_not_pad_a_feed(self):
+        """With nothing requested and no Induct papers, the page is untouched."""
+        n = 10
+        scores = np.linspace(1.0, 0.0, n)
+        vecs = np.eye(n)
+        streams = self._streams(n=n)
+        assert select_with_quota(scores, vecs, streams, k=6) == list(range(6))
