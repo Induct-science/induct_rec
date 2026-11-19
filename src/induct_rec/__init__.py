@@ -1,6 +1,9 @@
 from .algorithm import (
     build_user_profile_vec,
     rank_candidates,
+    cited_author_strength,
+    cited_author_factor,
+    CITED_AUTHOR_SATURATION,
     mmr_select,
     select_with_quota,
     DEFAULT_SLOT_PATTERN,
@@ -16,6 +19,9 @@ from .algorithm import (
 __all__ = [
     "build_user_profile_vec",
     "rank_candidates",
+    "cited_author_strength",
+    "cited_author_factor",
+    "CITED_AUTHOR_SATURATION",
     "mmr_select",
     "select_with_quota",
     "DEFAULT_SLOT_PATTERN",

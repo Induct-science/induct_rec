@@ -34,3 +34,42 @@ candidate_ids = list(range(100))
 recommendations = recommend_topk(user_vec, candidate_vecs, candidate_ids, k=5)
 print(recommendations)
 ```
+
+## The staged pipeline
+
+`rank_candidates` is what Induct actually runs; `recommend_topk` above is the
+older single-pass function, kept as a fallback. The stages, in order:
+
+1. **Similarity** — cosine between the reader's profile vector and each paper.
+2. **Gate** — drop everything below `min_similarity`.
+3. **Rerank** (optional) — a seam for a cross-encoder; not in use.
+4. **Score** — similarity × recency × credibility × the reader's cited-author
+   factor.
+5. **Select** — reserved slots, with MMR diversification inside them.
+
+### People the reader has cited
+
+The one term that is about the reader rather than the paper. The host passes
+`candidate_cited_author_strength` — for each candidate, a number in [0, 1]
+saying how strongly this reader has drawn on the people who wrote it — and
+the score is multiplied by `1 + cited_author_weight * strength`.
+
+```python
+from induct_rec import cited_author_strength, cited_author_factor
+
+cited_author_strength(0)    # 0.0   never cited
+cited_author_strength(1)    # 0.29  one of their works
+cited_author_strength(10)   # 1.0   ten or more: as much as it ever counts
+
+cited_author_factor(1.0, 0.5)   # 1.5
+```
+
+It is applied after the gate, so it reorders papers that already qualified on
+relevance and cannot bring an off-topic one in; and it is bounded, so a
+reader's closest collaborator is worth at most `1 + weight`. With no
+strengths passed, or a weight of 0, the pipeline is exactly what it was.
+
+`cited_author_factor` is exported so a host that stores a ranked feed can
+apply the same factor when it serves it, and divide it back out of what it
+stores. Who a reader has cited is the host's data; this package never sees a
+name.

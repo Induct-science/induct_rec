@@ -350,6 +350,55 @@ def mmr_select(scores, vecs, k, lam=0.7):
     return chosen
 
 
+#: How many of an author's works a reader has to have cited before that author
+#: counts for as much as they ever will. Past this the strength is 1.0.
+#:
+#: The curve is logarithmic on purpose. The step from "never cited" to "cited
+#: once" is the informative one — it says the reader knows this person's work
+#: exists and found it worth building on. The step from the twentieth citation
+#: to the twenty-first says nothing new, and a linear scale would hand the
+#: whole effect to a reader's two or three closest collaborators.
+CITED_AUTHOR_SATURATION = 10
+
+
+def cited_author_strength(works_cited, saturation: int = CITED_AUTHOR_SATURATION) -> float:
+    """
+    How strongly a reader has drawn on one author, in [0, 1].
+
+    `works_cited` is the number of distinct works by that author the reader's
+    own papers cite. 0 gives 0.0; one gives about 0.29; `saturation` or more
+    gives 1.0.
+    """
+    try:
+        n = float(works_cited or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if n <= 0:
+        return 0.0
+    return float(min(1.0, np.log1p(n) / np.log1p(max(saturation, 1))))
+
+
+def cited_author_factor(strength, weight: float):
+    """
+    The multiplier for a strength (scalar or array): 1 + weight * strength.
+
+    One definition, exported, because the host has to be able to apply the
+    *same* factor outside the pipeline. Induct stores a reader's ranked feed
+    and serves it for days; a bias that lived only inside `rank_candidates`
+    would reach nobody until the next recompute. So the host multiplies the
+    stored score by this at serve time — and divides it back out of what it
+    stores, so the factor is never counted twice.
+
+    Strengths are clipped to [0, 1] and anything unreadable is treated as 0,
+    so a bad value can cost a paper its boost and never more than that.
+    """
+    s = np.nan_to_num(np.asarray(strength, dtype=float), nan=0.0,
+                      posinf=1.0, neginf=0.0)
+    s = np.clip(s, 0.0, 1.0)
+    out = 1.0 + max(float(weight or 0.0), 0.0) * s
+    return float(out) if out.ndim == 0 else out
+
+
 def rank_candidates(
     user_vec,
     candidate_vecs,
@@ -371,6 +420,8 @@ def rank_candidates(
     slot_pattern=None,
     rerank_fn=None,
     rerank_top_n: int = 100,
+    candidate_cited_author_strength=None,
+    cited_author_weight: float = 0.0,
 ):
     """
     The full recommendation pipeline, in one place, with explicit stages.
@@ -404,6 +455,20 @@ def rank_candidates(
       "recency"      — (1 + w*log1p(1/age)), no salience at all. Prefers a very
          relevant paper from this year over a famous one from 2011.
       "none"         — no recency term.
+
+    `candidate_cited_author_strength` is the one term that is about *this
+    reader* rather than about the paper: for each candidate, how strongly the
+    reader has already drawn on the people who wrote it, in [0, 1], where 0 is
+    "has never cited any of its authors". It multiplies the score by
+    (1 + cited_author_weight * strength). See `cited_author_factor`.
+
+    It is a factor in stage 4 and nowhere else, which is what keeps it honest:
+    it is applied after the gate, so having cited somebody cannot bring one of
+    their off-topic papers into the feed — it reorders papers that already
+    qualified on relevance. And it is bounded, so the most-cited collaborator
+    in a reader's record is worth at most (1 + weight) and cannot bury
+    everybody else. With no strengths given, or a weight of 0, the pipeline
+    is exactly what it was.
 
     Returns [(paper_id, score)] with **strictly decreasing** scores. That is not
     cosmetic: the precompute path stores only (paper_id, score) and the serving
@@ -472,6 +537,10 @@ def rank_candidates(
     if candidate_is_induct is not None and induct_boost != 1.0:
         is_ind = np.asarray([bool(candidate_is_induct[i]) for i in idx])
         factor = factor * np.where(is_ind, induct_boost, 1.0)
+
+    if candidate_cited_author_strength is not None and cited_author_weight:
+        strength = [candidate_cited_author_strength[i] for i in idx]
+        factor = factor * cited_author_factor(strength, cited_author_weight)
 
     scores = rel * factor
 
